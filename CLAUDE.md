@@ -9,6 +9,11 @@ A regime-switching pipeline for a BTC/ETH two-asset portfolio. A master orchestr
 - **Momentum** — time-series momentum / trend-following on BTC and ETH individually
 - **Mean Reversion** — relative-value on the BTC-ETH spread (Ornstein-Uhlenbeck formulation); regime health measured via drawdown and VaR
 
+## pipeline
+  evaluation/ ──scores──▶ models/ ──signals──▶ strats/ ──weights──▶ backtest/
+                            │                    │
+                    vol/price/co_mov     momentum/mean_rev/orchestrator
+
 ## Commands
 
 ```bash
