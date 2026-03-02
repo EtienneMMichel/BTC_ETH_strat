@@ -6,7 +6,7 @@ from typing import Callable, Optional
 
 import websockets
 
-from trading.core.events import MarketEvent
+from core.events import MarketEvent
 
 WS_BASE = "wss://fstream.binance.com/ws"
 

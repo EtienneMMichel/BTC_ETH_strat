@@ -75,6 +75,7 @@ def load_assets(
     frames: dict[str, pd.DataFrame] = {}
 
     for name, symbol in assets.items():
+        print("raw_dir: ", raw_dir)
         sym_dir = raw_dir / symbol
         if not sym_dir.exists():
             raise FileNotFoundError(f"Symbol directory not found: {sym_dir}")

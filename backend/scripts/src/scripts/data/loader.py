@@ -5,7 +5,7 @@ from typing import Iterator
 
 import polars as pl
 
-from trading.core.events import MarketEvent
+from core.events import MarketEvent
 
 
 def stream_events(parquet_path: Path, symbol: str, funding_path: Path | None = None) -> Iterator[MarketEvent]:
