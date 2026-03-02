@@ -28,13 +28,33 @@ export interface VolEvalResult {
 
 // ── Price Forecast ────────────────────────────────────────────────────────
 
+export type RegimeClassifierType = 'threshold' | 'vol_quantile' | 'manual'
+
+export interface ManualRegimeDateRange {
+  label: string
+  start: string
+  end: string
+}
+
 export interface PriceForecastRequest {
-  asset: 'BTC' | 'ETH'
+  // Legacy single-asset (backward-compat)
+  asset?: 'BTC' | 'ETH'
+  // Multi-asset
+  assets?: ('BTC' | 'ETH')[]
+  cross_asset?: boolean
   forecast_horizon: string
-  min_train_bars: number
   models: string[]
   model_resolutions: Record<string, string>
   n_calibration_bins?: number
+  // Feature 1 — date split
+  train_start?: string
+  train_end?: string
+  test_start?: string
+  test_end?: string
+  // Feature 4 — regime conditioning
+  regime_conditioning?: boolean
+  regime_classifier_type?: RegimeClassifierType
+  regime_classifier_params?: Record<string, unknown>
 }
 
 export interface ConfusionMatrix {
@@ -101,14 +121,42 @@ export interface PriceForecastModelMetrics {
   output_type: 'direction' | 'amplitude' | 'probability'
 }
 
-export interface PriceForecastResult {
+export interface PerAssetForecastData {
   signals: Record<string, TimeSeries>
   metrics: Record<string, PriceForecastModelMetrics>
   prices: TimeSeries
-  asset: string
-  forecast_horizon: string
   model_resolutions: Record<string, string>
+}
+
+export interface PriceForecastResult {
+  // New per-asset shape
+  assets?: string[]
+  per_asset?: Record<string, PerAssetForecastData>
+  forecast_horizon: string
   warnings?: string[]
+  train_period?: [string | null, string | null]
+  test_period?: [string | null, string | null]
+  // Feature 4 — regime conditioning
+  regime_labels?: [string, string][]
+  regime_metrics?: Record<string, Record<string, Record<string, PriceForecastModelMetrics>>>
+  // Legacy flat shape (kept for backward compat / normalizeResult)
+  signals?: Record<string, TimeSeries>
+  metrics?: Record<string, PriceForecastModelMetrics>
+  prices?: TimeSeries
+  asset?: string
+  model_resolutions?: Record<string, string>
+}
+
+// ── Saved runs ────────────────────────────────────────────────────────────
+
+export interface SavedRunMeta {
+  run_id: string
+  run_name: string
+  timestamp: string
+  assets: string[]
+  forecast_horizon: string
+  models: string[]
+  summary_metrics: Record<string, Record<string, Record<string, number | null>>>
 }
 
 // ── Co-Movement ───────────────────────────────────────────────────────────

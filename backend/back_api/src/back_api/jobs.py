@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import traceback
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Coroutine, Literal
@@ -74,7 +75,7 @@ class JobStore:
             async with self._lock:
                 rec = self._store[job_id]
                 rec.status = "failed"
-                rec.error = str(exc)
+                rec.error = traceback.format_exc()
         finally:
             await self._evict_if_needed()
 

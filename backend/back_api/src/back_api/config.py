@@ -9,10 +9,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # parents[4] is the repo root regardless of the working directory.
 _REPO_ROOT = Path(__file__).parents[4]
 _DEFAULT_DATA_DIR = _REPO_ROOT / "backend" / "data" / "raw"
+_DEFAULT_SAVED_RUNS_DIR = _REPO_ROOT / "backend" / "data" / "saved_runs"
 
 
 class Settings(BaseSettings):
     data_dir: Path = _DEFAULT_DATA_DIR
+    saved_runs_dir: Path = _DEFAULT_SAVED_RUNS_DIR
     host: str = "0.0.0.0"
     port: int = 8000
     workers: int = 1

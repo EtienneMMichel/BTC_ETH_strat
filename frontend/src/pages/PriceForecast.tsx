@@ -1,12 +1,18 @@
 import { useState, useMemo } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { submitPriceForecast, getPriceForecastJob } from '@/lib/api/models'
+import { submitPriceForecast, getPriceForecastJob, getPriceForecastDataRange } from '@/lib/api/models'
 import { MultiLineChart } from '@/components/charts/MultiLineChart'
 import { RocCurveChart } from '@/components/charts/RocCurveChart'
 import { CalibrationChart } from '@/components/charts/CalibrationChart'
 import { HistogramChart } from '@/components/charts/HistogramChart'
 import { AcfChart } from '@/components/charts/AcfChart'
 import { ReliabilityChart } from '@/components/charts/ReliabilityChart'
+import { RegimeTimelineChart } from '@/components/charts/RegimeTimelineChart'
+import { DateSplitPanel } from '@/components/price-forecast/DateSplitPanel'
+import { AssetTabs } from '@/components/price-forecast/AssetTabs'
+import { SaveRunDialog } from '@/components/price-forecast/SaveRunDialog'
+import { SavedRunsPanel } from '@/components/price-forecast/SavedRunsPanel'
+import { RegimeConditioningPanel } from '@/components/price-forecast/RegimeConditioningPanel'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
@@ -15,8 +21,10 @@ import { JobProgressBar } from '@/components/ui/progress'
 import type {
   PriceForecastRequest,
   PriceForecastResult,
+  PerAssetForecastData,
   ConfusionMatrix,
   PriceForecastModelMetrics,
+  RegimeClassifierType,
 } from '@/types/models'
 
 // ── Constants ─────────────────────────────────────────────────────────────
@@ -24,13 +32,17 @@ import type {
 const ALL_MODELS = ['tsmom', 'momentum', 'ema_crossover', 'hp_filter', 'kalman', 'logistic']
 
 const MODEL_COLORS: Record<string, string> = {
-  tsmom:        '#38bdf8',
-  momentum:     '#a78bfa',
-  ema_crossover:'#34d399',
-  hp_filter:    '#fbbf24',
-  kalman:       '#f87171',
-  logistic:     '#fb923c',
+  tsmom:          '#38bdf8',
+  momentum:       '#a78bfa',
+  ema_crossover:  '#34d399',
+  hp_filter:      '#fbbf24',
+  kalman:         '#f87171',
+  logistic:       '#fb923c',
+  cross_tsmom:    '#e879f9',
+  cross_momentum: '#fb7185',
 }
+
+const REGIME_PALETTE = ['#38bdf8', '#34d399', '#fbbf24', '#f87171', '#a78bfa', '#fb923c']
 
 const OUTPUT_TYPE_BADGE: Record<string, string> = {
   direction:   'bg-sky-900 text-sky-300',
@@ -50,7 +62,38 @@ const DEFAULT_RESOLUTIONS: Record<string, string> = {
 const RESOLUTION_OPTIONS = ['1min', '5min', '15min', '1h', '4h', '1D']
 const HORIZON_OPTIONS = ['1h', '4h', '8h', '1D', '3D', '1W']
 
-// ── Confusion matrix components ───────────────────────────────────────────
+// ── Normalize legacy flat result to per_asset shape ───────────────────────
+
+function normalizeResult(res: PriceForecastResult): PriceForecastResult {
+  if (res.per_asset) return res
+  const assetName = res.asset ?? 'BTC'
+  return {
+    assets: [assetName],
+    per_asset: {
+      [assetName]: {
+        signals: res.signals ?? {},
+        metrics: res.metrics ?? {},
+        prices: res.prices ?? [],
+        model_resolutions: res.model_resolutions ?? {},
+      },
+    },
+    forecast_horizon: res.forecast_horizon,
+    warnings: res.warnings,
+    train_period: res.train_period,
+    test_period: res.test_period,
+    regime_labels: res.regime_labels,
+    regime_metrics: res.regime_metrics,
+  }
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+function buildRegimeColorMap(labels: [string, string][]): Record<string, string> {
+  const unique = [...new Set(labels.map(([, l]) => l))].sort()
+  return Object.fromEntries(unique.map((l, i) => [l, REGIME_PALETTE[i % REGIME_PALETTE.length]]))
+}
+
+// ── Confusion matrix ───────────────────────────────────────────────────────
 
 function ConfusionBar({ cm }: { cm: ConfusionMatrix }) {
   const total = cm.tp + cm.fp + cm.tn + cm.fn
@@ -104,33 +147,108 @@ function ConfusionGrid({ cm }: { cm: ConfusionMatrix }) {
   )
 }
 
-// ── Metric number helpers ─────────────────────────────────────────────────
+// ── Metric helpers ─────────────────────────────────────────────────────────
 
 function pct(v: number | null | undefined) {
   if (v == null || isNaN(v)) return '—'
   return (v * 100).toFixed(1) + '%'
 }
-
 function fmt4(v: number | null | undefined) {
   if (v == null || isNaN(v)) return '—'
   return v.toFixed(4)
 }
-
 function fmt3(v: number | null | undefined) {
   if (v == null || isNaN(v)) return '—'
   return v.toFixed(3)
 }
 
+// ── Regime filter ──────────────────────────────────────────────────────────
+
+function RegimeFilter({
+  labels,
+  selected,
+  colorMap,
+  onChange,
+}: {
+  labels: [string, string][]
+  selected: string[]
+  colorMap: Record<string, string>
+  onChange: (v: string[]) => void
+}) {
+  const uniqueLabels = useMemo(() => [...new Set(labels.map(([, l]) => l))].sort(), [labels])
+  const toggle = (l: string) =>
+    onChange(selected.includes(l) ? selected.filter((x) => x !== l) : [...selected, l])
+
+  return (
+    <div className="flex items-center gap-2 flex-wrap">
+      <span className="text-[10px] text-slate-500 shrink-0">Regime filter:</span>
+      <button
+        onClick={() => onChange([])}
+        className={`text-[10px] px-2 py-0.5 rounded-full transition-colors ${
+          selected.length === 0
+            ? 'bg-slate-600 text-white'
+            : 'bg-slate-800 text-slate-400 hover:bg-slate-700'
+        }`}
+      >
+        All
+      </button>
+      {uniqueLabels.map((l) => (
+        <button
+          key={l}
+          onClick={() => toggle(l)}
+          className="text-[10px] px-2 py-0.5 rounded-full transition-colors border"
+          style={
+            selected.includes(l)
+              ? { background: colorMap[l], borderColor: colorMap[l], color: '#fff' }
+              : { background: 'transparent', borderColor: colorMap[l], color: colorMap[l] }
+          }
+        >
+          {l}
+        </button>
+      ))}
+    </div>
+  )
+}
+
 // ── Page ──────────────────────────────────────────────────────────────────
 
+type AssetMode = 'BTC' | 'ETH' | 'Both'
+
 export function PriceForecastPage() {
-  const [asset, setAsset] = useState<'BTC' | 'ETH'>('BTC')
+  const [assetMode, setAssetMode] = useState<AssetMode>('BTC')
+  const [crossAsset, setCrossAsset] = useState(false)
   const [horizon, setHorizon] = useState('1D')
-  const [minTrainBars, setMinTrainBars] = useState(252)
-  const [selectedModels, setSelectedModels] = useState<string[]>(ALL_MODELS.filter((m) => m !== 'logistic'))
+  const [selectedModels, setSelectedModels] = useState<string[]>(
+    ALL_MODELS.filter((m) => m !== 'logistic')
+  )
   const [modelResolutions, setModelResolutions] = useState<Record<string, string>>(DEFAULT_RESOLUTIONS)
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [jobId, setJobId] = useState<string | null>(null)
+  const [savedResult, setSavedResult] = useState<PriceForecastResult | null>(null)
+
+  // Feature 1 — date split
+  const [dateEnabled, setDateEnabled] = useState(false)
+  const [trainStart, setTrainStart] = useState('')
+  const [trainEnd, setTrainEnd] = useState('')
+  const [testStart, setTestStart] = useState('')
+  const [testEnd, setTestEnd] = useState('')
+
+  // Feature 4 — regime conditioning
+  const [regimeEnabled, setRegimeEnabled] = useState(false)
+  const [regimeType, setRegimeType] = useState<RegimeClassifierType>('vol_quantile')
+  const [regimeParams, setRegimeParams] = useState<Record<string, unknown>>({})
+
+  // Regime filter (right panel)
+  const [selectedRegimes, setSelectedRegimes] = useState<string[]>([])
+
+  const [activeAsset, setActiveAsset] = useState<string>('BTC')
+
+  const { data: dataRanges } = useQuery({
+    queryKey: ['price-forecast-data-range'],
+    queryFn: getPriceForecastDataRange,
+    staleTime: Infinity,
+  })
+  const dataRange = dataRanges?.['BTC']
 
   const { data: job } = useQuery({
     queryKey: ['price-forecast', jobId],
@@ -140,18 +258,34 @@ export function PriceForecastPage() {
       q.state.data?.status === 'done' || q.state.data?.status === 'failed' ? false : 2000,
   })
 
+  const assetList: ('BTC' | 'ETH')[] =
+    assetMode === 'Both' ? ['BTC', 'ETH'] : [assetMode]
+
   const handleSubmit = async () => {
+    setSavedResult(null)
+    setSelectedRegimes([])
     setIsSubmitting(true)
     try {
       const req: PriceForecastRequest = {
-        asset,
+        assets: assetList,
+        cross_asset: assetMode === 'Both' && crossAsset,
         forecast_horizon: horizon,
-        min_train_bars: minTrainBars,
         models: selectedModels,
         model_resolutions: modelResolutions,
+        ...(dateEnabled && trainStart && trainEnd && testStart && testEnd
+          ? { train_start: trainStart, train_end: trainEnd, test_start: testStart, test_end: testEnd }
+          : {}),
+        ...(regimeEnabled
+          ? {
+              regime_conditioning: true,
+              regime_classifier_type: regimeType,
+              regime_classifier_params: regimeParams,
+            }
+          : {}),
       }
       const { job_id } = await submitPriceForecast(req)
       setJobId(job_id)
+      setActiveAsset(assetList[0])
     } finally {
       setIsSubmitting(false)
     }
@@ -159,46 +293,90 @@ export function PriceForecastPage() {
 
   const toggleModel = (m: string) =>
     setSelectedModels((prev) => prev.includes(m) ? prev.filter((x) => x !== m) : [...prev, m])
-
   const setRes = (model: string, res: string) =>
     setModelResolutions((prev) => ({ ...prev, [model]: res }))
+  const handleDateChange = (
+    field: 'trainStart' | 'trainEnd' | 'testStart' | 'testEnd',
+    value: string
+  ) => {
+    if (field === 'trainStart') setTrainStart(value)
+    else if (field === 'trainEnd') setTrainEnd(value)
+    else if (field === 'testStart') setTestStart(value)
+    else setTestEnd(value)
+  }
+  const handleSetAllDates = (ts: string, te: string, ss: string, se: string) => {
+    setTrainStart(ts); setTrainEnd(te); setTestStart(ss); setTestEnd(se)
+  }
 
-  const result: PriceForecastResult | undefined = job?.result
+  const rawResult = savedResult ?? (job?.result ?? undefined)
+  const result = useMemo(
+    () => (rawResult ? normalizeResult(rawResult) : undefined),
+    [rawResult]
+  )
 
-  // Signal series for MultiLineChart (at model resolution, downsampled to daily for display)
+  const displayedAssets = result?.assets ?? []
+  const currentAsset = displayedAssets.includes(activeAsset) ? activeAsset : (displayedAssets[0] ?? 'BTC')
+  const assetData: PerAssetForecastData | undefined = result?.per_asset?.[currentAsset]
+
+  // Regime color map (stable across filter changes)
+  const regimeColorMap = useMemo(
+    () => (result?.regime_labels ? buildRegimeColorMap(result.regime_labels) : {}),
+    [result?.regime_labels]
+  )
+
+  // Active metric groups: aggregate or per-regime slices
+  const activeMetricGroups = useMemo(() => {
+    if (!assetData) return []
+    if (selectedRegimes.length === 0 || !result?.regime_metrics) {
+      return [{ label: null as string | null, metrics: assetData.metrics }]
+    }
+    const assetRM = result.regime_metrics[currentAsset] ?? {}
+    return selectedRegimes
+      .map((regime) => ({
+        label: regime,
+        metrics: Object.fromEntries(
+          Object.keys(assetData.metrics)
+            .map((model) => [model, assetRM[model]?.[regime]])
+            .filter(([, m]) => m != null)
+        ) as Record<string, PriceForecastModelMetrics>,
+      }))
+      .filter((g) => Object.keys(g.metrics).length > 0)
+  }, [assetData, result, selectedRegimes, currentAsset])
+
+  // Signal series (always aggregate)
   const signalSeries = useMemo(() => {
-    if (!result) return []
-    return Object.entries(result.signals).map(([name, data]) => ({
+    if (!assetData) return []
+    return Object.entries(assetData.signals).map(([name, data]) => ({
       data,
       color: MODEL_COLORS[name] ?? '#ffffff',
-      title: `${name}@${result.model_resolutions[name] ?? '?'}`,
+      title: `${name}@${assetData.model_resolutions[name] ?? '?'}`,
     }))
-  }, [result])
+  }, [assetData])
 
-  // ROC curves
+  // ROC curves — use active metric groups
   const rocCurves = useMemo(() => {
-    if (!result) return []
-    return Object.entries(result.metrics).map(([name, m]) => ({
-      name,
-      color: MODEL_COLORS[name] ?? '#ffffff',
-      points: m.direction.roc_curve,
-      auc: m.direction.auc,
-    }))
-  }, [result])
+    if (!assetData) return []
+    return activeMetricGroups.flatMap((group) =>
+      Object.entries(group.metrics).map(([name, m]) => ({
+        name: group.label ? `${name}·${group.label}` : name,
+        color: group.label ? regimeColorMap[group.label] ?? (MODEL_COLORS[name] ?? '#fff') : (MODEL_COLORS[name] ?? '#fff'),
+        points: m.direction.roc_curve,
+        auc: m.direction.auc,
+      }))
+    )
+  }, [activeMetricGroups, assetData, regimeColorMap])
 
-  // Models with logistic output
+  // Logistic models in active groups
   const logisticModels = useMemo(() => {
-    if (!result) return []
-    return Object.entries(result.metrics)
+    if (!assetData) return []
+    return Object.entries(assetData.metrics)
       .filter(([, m]) => m.output_type === 'probability')
       .map(([name]) => name)
-  }, [result])
+  }, [assetData])
 
   const headerTag = result
-    ? `${result.asset} | Horizon: ${result.forecast_horizon} | ${
-        Object.entries(result.model_resolutions)
-          .map(([k, v]) => `${k}@${v}`)
-          .join(' ')
+    ? `${displayedAssets.join('+')} | ${result.forecast_horizon}${
+        result.test_period?.[0] ? ` | Test: ${result.test_period[0]} → ${result.test_period[1]}` : ''
       }`
     : null
 
@@ -212,23 +390,35 @@ export function PriceForecastPage() {
         <div>
           <Label className="mb-2 block text-xs text-slate-400">Asset</Label>
           <div className="flex gap-2">
-            {(['BTC', 'ETH'] as const).map((a) => (
+            {(['BTC', 'ETH', 'Both'] as AssetMode[]).map((a) => (
               <button
                 key={a}
-                onClick={() => setAsset(a)}
+                onClick={() => setAssetMode(a)}
                 className={`px-3 py-1 rounded text-sm font-medium transition-colors ${
-                  asset === a
-                    ? 'bg-sky-600 text-white'
-                    : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+                  assetMode === a ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
                 }`}
               >
                 {a}
               </button>
             ))}
           </div>
+          {assetMode === 'Both' && (
+            <div className="flex items-center gap-2 mt-2">
+              <input
+                type="checkbox"
+                id="cross-asset"
+                checked={crossAsset}
+                onChange={(e) => setCrossAsset(e.target.checked)}
+                className="accent-sky-500"
+              />
+              <Label htmlFor="cross-asset" className="text-xs text-slate-300 cursor-pointer">
+                Cross-asset signals
+              </Label>
+            </div>
+          )}
         </div>
 
-        {/* Forecast horizon pills */}
+        {/* Forecast horizon */}
         <div>
           <Label className="mb-2 block text-xs text-slate-400">Forecast Horizon</Label>
           <div className="flex flex-wrap gap-1">
@@ -237,9 +427,7 @@ export function PriceForecastPage() {
                 key={h}
                 onClick={() => setHorizon(h)}
                 className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${
-                  horizon === h
-                    ? 'bg-sky-600 text-white'
-                    : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+                  horizon === h ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
                 }`}
               >
                 {h}
@@ -248,51 +436,52 @@ export function PriceForecastPage() {
           </div>
         </div>
 
-        {/* Min train bars */}
-        <div>
-          <Label className="mb-1 block text-xs text-slate-400">Min train bars: {minTrainBars}</Label>
-          <input
-            type="range" min={50} max={500} step={10}
-            value={minTrainBars}
-            onChange={(e) => setMinTrainBars(Number(e.target.value))}
-            className="w-full accent-sky-500"
-          />
-        </div>
-
-        {/* Models + resolution dropdowns */}
+        {/* Models */}
         <div>
           <Label className="mb-2 block text-xs text-slate-400">Models</Label>
           <div className="space-y-2">
-            {ALL_MODELS.map((m) => {
-              const isHpFilter = m === 'hp_filter'
-              return (
-                <div key={m} className="flex items-center gap-2">
-                  <input
-                    type="checkbox"
-                    checked={selectedModels.includes(m)}
-                    onChange={() => toggleModel(m)}
-                    className="accent-sky-500 shrink-0"
-                  />
-                  <span
-                    className="inline-block w-2 h-2 rounded-full shrink-0"
-                    style={{ background: MODEL_COLORS[m] }}
-                  />
-                  <span className="text-xs text-slate-300 flex-1 truncate">{m}</span>
-                  <select
-                    value={modelResolutions[m] ?? '1D'}
-                    onChange={(e) => setRes(m, e.target.value)}
-                    disabled={isHpFilter}
-                    className="text-xs bg-slate-800 text-slate-300 border border-slate-700 rounded px-1 py-0.5 disabled:opacity-40 disabled:cursor-not-allowed"
-                  >
-                    {RESOLUTION_OPTIONS.map((r) => (
-                      <option key={r} value={r}>{r}</option>
-                    ))}
-                  </select>
-                </div>
-              )
-            })}
+            {ALL_MODELS.map((m) => (
+              <div key={m} className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={selectedModels.includes(m)}
+                  onChange={() => toggleModel(m)}
+                  className="accent-sky-500 shrink-0"
+                />
+                <span className="inline-block w-2 h-2 rounded-full shrink-0" style={{ background: MODEL_COLORS[m] }} />
+                <span className="text-xs text-slate-300 flex-1 truncate">{m}</span>
+                <select
+                  value={modelResolutions[m] ?? '1D'}
+                  onChange={(e) => setRes(m, e.target.value)}
+                  disabled={m === 'hp_filter'}
+                  className="text-xs bg-slate-800 text-slate-300 border border-slate-700 rounded px-1 py-0.5 disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  {RESOLUTION_OPTIONS.map((r) => <option key={r} value={r}>{r}</option>)}
+                </select>
+              </div>
+            ))}
           </div>
         </div>
+
+        <DateSplitPanel
+          enabled={dateEnabled}
+          onToggle={setDateEnabled}
+          trainStart={trainStart}
+          trainEnd={trainEnd}
+          testStart={testStart}
+          testEnd={testEnd}
+          dataRange={dataRange}
+          onChange={handleDateChange}
+          onSetAll={handleSetAllDates}
+        />
+
+        <RegimeConditioningPanel
+          enabled={regimeEnabled}
+          classifierType={regimeType}
+          params={regimeParams}
+          hasBothAssets={assetMode === 'Both'}
+          onChange={(en, type, params) => { setRegimeEnabled(en); setRegimeType(type); setRegimeParams(params) }}
+        />
 
         <Button
           onClick={handleSubmit}
@@ -310,15 +499,25 @@ export function PriceForecastPage() {
             <JobProgressBar status={job.status} />
           </div>
         )}
-        {job?.error && <p className="text-xs text-rose-400">{job.error}</p>}
+        {job?.error && (
+          <pre className="text-[10px] text-rose-400 whitespace-pre-wrap break-all bg-rose-950/30 rounded p-2">
+            {job.error}
+          </pre>
+        )}
+
+        {job?.status === 'done' && jobId && <SaveRunDialog jobId={jobId} />}
+        <SavedRunsPanel onLoad={(r) => { setSavedResult(r); setSelectedRegimes([]); setActiveAsset((r.assets ?? ['BTC'])[0]) }} />
       </div>
 
       {/* ── Right panel ── */}
       <div className="flex-1 flex flex-col gap-6 min-w-0 overflow-y-auto">
-        {result ? (
+        {result && assetData ? (
           <>
-            {/* Header bar */}
-            <div className="text-sm text-slate-400 font-mono">{headerTag}</div>
+            {/* Header + asset tabs */}
+            <div className="flex items-center justify-between flex-wrap gap-2">
+              <span className="text-sm text-slate-400 font-mono">{headerTag}</span>
+              <AssetTabs assets={displayedAssets} active={currentAsset} onSelect={setActiveAsset} />
+            </div>
 
             {/* Warnings */}
             {result.warnings && result.warnings.length > 0 && (
@@ -327,18 +526,37 @@ export function PriceForecastPage() {
               </div>
             )}
 
+            {/* Regime timeline + filter (shown whenever regime data is present) */}
+            {result.regime_labels && result.regime_labels.length > 0 && (
+              <div className="space-y-2 bg-slate-900/50 rounded-lg p-3">
+                <RegimeTimelineChart data={result.regime_labels} height={24} />
+                <RegimeFilter
+                  labels={result.regime_labels}
+                  selected={selectedRegimes}
+                  colorMap={regimeColorMap}
+                  onChange={setSelectedRegimes}
+                />
+              </div>
+            )}
+
             {/* ── Section A: Direction ── */}
             <section>
               <h2 className="text-sm font-semibold text-sky-400 mb-3">A — Direction</h2>
-
-              {/* Metric cards */}
-              <div className="grid grid-cols-2 lg:grid-cols-3 gap-3 mb-4">
-                {Object.entries(result.metrics).map(([name, m]) => (
-                  <ModelDirectionCard key={name} name={name} m={m} />
-                ))}
-              </div>
-
-              {/* ROC chart */}
+              {activeMetricGroups.map((group) => (
+                <div key={group.label ?? '__all__'} className="mb-4">
+                  {group.label && (
+                    <h3 className="text-xs font-medium mb-2 flex items-center gap-1.5" style={{ color: regimeColorMap[group.label] }}>
+                      <span className="w-2 h-2 rounded-sm inline-block" style={{ background: regimeColorMap[group.label] }} />
+                      {group.label}
+                    </h3>
+                  )}
+                  <div className="grid grid-cols-2 lg:grid-cols-3 gap-3 mb-4">
+                    {Object.entries(group.metrics).map(([name, m]) => (
+                      <ModelDirectionCard key={name} name={name} m={m} />
+                    ))}
+                  </div>
+                </div>
+              ))}
               {rocCurves.length > 0 && (
                 <div className="rounded-lg overflow-hidden bg-slate-900 p-3">
                   <RocCurveChart curves={rocCurves} height={280} />
@@ -352,42 +570,42 @@ export function PriceForecastPage() {
             {/* ── Section B: Amplitude ── */}
             <section>
               <h2 className="text-sm font-semibold text-violet-400 mb-3">B — Amplitude</h2>
-
-              {/* IC cards */}
-              <div className="grid grid-cols-2 lg:grid-cols-3 gap-3 mb-4">
-                {Object.entries(result.metrics).map(([name, m]) => (
-                  <AmplitudeCard key={name} name={name} m={m} />
-                ))}
-              </div>
-
-              {/* Calibration charts */}
-              <div className="grid grid-cols-2 lg:grid-cols-3 gap-3 mb-4">
-                {Object.entries(result.metrics).map(([name, m]) => (
-                  <Card key={name}>
-                    <CardHeader className="pb-1">
-                      <CardTitle className="text-xs flex items-center gap-1.5">
-                        <span className="w-2 h-2 rounded-full inline-block" style={{ background: MODEL_COLORS[name] }} />
-                        {name} — Calibration
-                      </CardTitle>
-                    </CardHeader>
-                    <CardContent className="pt-0">
-                      <CalibrationChart
-                        data={m.amplitude.calibration_bins}
-                        color={MODEL_COLORS[name] ?? '#fff'}
-                        height={160}
-                      />
-                    </CardContent>
-                  </Card>
-                ))}
-              </div>
-
-              {/* Probability sub-section (logistic only) */}
-              {logisticModels.length > 0 && (
+              {activeMetricGroups.map((group) => (
+                <div key={group.label ?? '__all__'} className="mb-4">
+                  {group.label && (
+                    <h3 className="text-xs font-medium mb-2 flex items-center gap-1.5" style={{ color: regimeColorMap[group.label] }}>
+                      <span className="w-2 h-2 rounded-sm inline-block" style={{ background: regimeColorMap[group.label] }} />
+                      {group.label}
+                    </h3>
+                  )}
+                  <div className="grid grid-cols-2 lg:grid-cols-3 gap-3 mb-3">
+                    {Object.entries(group.metrics).map(([name, m]) => (
+                      <AmplitudeCard key={name} name={name} m={m} />
+                    ))}
+                  </div>
+                  <div className="grid grid-cols-2 lg:grid-cols-3 gap-3">
+                    {Object.entries(group.metrics).map(([name, m]) => (
+                      <Card key={name}>
+                        <CardHeader className="pb-1">
+                          <CardTitle className="text-xs flex items-center gap-1.5">
+                            <span className="w-2 h-2 rounded-full inline-block" style={{ background: MODEL_COLORS[name] }} />
+                            {name} — Calibration
+                          </CardTitle>
+                        </CardHeader>
+                        <CardContent className="pt-0">
+                          <CalibrationChart data={m.amplitude.calibration_bins} color={MODEL_COLORS[name] ?? '#fff'} height={160} />
+                        </CardContent>
+                      </Card>
+                    ))}
+                  </div>
+                </div>
+              ))}
+              {logisticModels.length > 0 && selectedRegimes.length === 0 && (
                 <div>
                   <h3 className="text-xs font-medium text-orange-400 mb-2">Probability metrics (logistic)</h3>
                   <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
                     {logisticModels.map((name) => {
-                      const m = result.metrics[name]
+                      const m = assetData.metrics[name]
                       return (
                         <Card key={name}>
                           <CardHeader className="pb-1">
@@ -397,11 +615,7 @@ export function PriceForecastPage() {
                             </CardTitle>
                           </CardHeader>
                           <CardContent className="pt-0 space-y-2">
-                            <ReliabilityChart
-                              data={m.amplitude.reliability_diagram ?? []}
-                              color={MODEL_COLORS[name] ?? '#fff'}
-                              height={200}
-                            />
+                            <ReliabilityChart data={m.amplitude.reliability_diagram ?? []} color={MODEL_COLORS[name] ?? '#fff'} height={200} />
                             <div className="flex gap-4 text-xs text-slate-400">
                               <span>Brier: <span className="text-slate-200">{fmt4(m.amplitude.brier_score)}</span></span>
                               <span>Log-Loss: <span className="text-slate-200">{fmt4(m.amplitude.log_loss)}</span></span>
@@ -418,55 +632,52 @@ export function PriceForecastPage() {
             {/* ── Section C: Additional Data ── */}
             <section>
               <h2 className="text-sm font-semibold text-emerald-400 mb-3">C — Additional Data</h2>
-
-              {/* Signals overlay */}
-              {signalSeries.length > 0 && (
+              {signalSeries.length > 0 && selectedRegimes.length === 0 && (
                 <div className="mb-4">
                   <p className="text-xs text-slate-500 mb-1">Signals (at model resolution)</p>
                   <MultiLineChart series={signalSeries} height={220} />
                 </div>
               )}
-
-              {/* Per-model histogram + ACF */}
-              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-                {Object.entries(result.metrics).map(([name, m]) => {
-                  const turn = m.additional.turnover
-                  const turnHigh = !isNaN(turn) && turn > 0.3
-                  const nObs = m.additional.signal_histogram.reduce((s, b) => s + b.count, 0)
-                  return (
-                    <Card key={name}>
-                      <CardHeader className="pb-1">
-                        <CardTitle className="text-xs flex items-center gap-2">
-                          <span className="w-2 h-2 rounded-full inline-block" style={{ background: MODEL_COLORS[name] }} />
-                          <span>{name}</span>
-                          <span className={`text-[10px] ${turnHigh ? 'text-amber-400' : 'text-slate-500'}`}>
-                            Turnover: {isNaN(turn) ? '—' : (turn * 100).toFixed(1) + '%'}
-                          </span>
-                        </CardTitle>
-                      </CardHeader>
-                      <CardContent className="pt-0 flex gap-3">
-                        <div className="flex-1 min-w-0">
-                          <p className="text-[9px] text-slate-600 mb-0.5">Signal distribution</p>
-                          <HistogramChart
-                            data={m.additional.signal_histogram}
-                            color={MODEL_COLORS[name] ?? '#fff'}
-                            height={140}
-                          />
-                        </div>
-                        <div className="flex-1 min-w-0">
-                          <p className="text-[9px] text-slate-600 mb-0.5">ACF (±1.96/√n)</p>
-                          <AcfChart
-                            data={m.additional.acf}
-                            color={MODEL_COLORS[name] ?? '#fff'}
-                            n_obs={nObs}
-                            height={140}
-                          />
-                        </div>
-                      </CardContent>
-                    </Card>
-                  )
-                })}
-              </div>
+              {activeMetricGroups.map((group) => (
+                <div key={group.label ?? '__all__'} className="mb-4">
+                  {group.label && (
+                    <h3 className="text-xs font-medium mb-2 flex items-center gap-1.5" style={{ color: regimeColorMap[group.label] }}>
+                      <span className="w-2 h-2 rounded-sm inline-block" style={{ background: regimeColorMap[group.label] }} />
+                      {group.label}
+                    </h3>
+                  )}
+                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                    {Object.entries(group.metrics).map(([name, m]) => {
+                      const turn = m.additional.turnover
+                      const turnHigh = !isNaN(turn) && turn > 0.3
+                      const nObs = m.additional.signal_histogram.reduce((s, b) => s + b.count, 0)
+                      return (
+                        <Card key={name}>
+                          <CardHeader className="pb-1">
+                            <CardTitle className="text-xs flex items-center gap-2">
+                              <span className="w-2 h-2 rounded-full inline-block" style={{ background: MODEL_COLORS[name] }} />
+                              <span>{name}</span>
+                              <span className={`text-[10px] ${turnHigh ? 'text-amber-400' : 'text-slate-500'}`}>
+                                Turnover: {isNaN(turn) ? '—' : (turn * 100).toFixed(1) + '%'}
+                              </span>
+                            </CardTitle>
+                          </CardHeader>
+                          <CardContent className="pt-0 flex gap-3">
+                            <div className="flex-1 min-w-0">
+                              <p className="text-[9px] text-slate-600 mb-0.5">Signal distribution</p>
+                              <HistogramChart data={m.additional.signal_histogram} color={MODEL_COLORS[name] ?? '#fff'} height={140} />
+                            </div>
+                            <div className="flex-1 min-w-0">
+                              <p className="text-[9px] text-slate-600 mb-0.5">ACF (±1.96/√n)</p>
+                              <AcfChart data={m.additional.acf} color={MODEL_COLORS[name] ?? '#fff'} n_obs={nObs} height={140} />
+                            </div>
+                          </CardContent>
+                        </Card>
+                      )
+                    })}
+                  </div>
+                </div>
+              ))}
             </section>
           </>
         ) : (
@@ -498,28 +709,13 @@ function ModelDirectionCard({ name, m }: { name: string; m: PriceForecastModelMe
       </CardHeader>
       <CardContent className="space-y-1 pt-0">
         <div className="grid grid-cols-2 gap-x-2 text-xs">
-          <span className={hitOk ? 'text-emerald-400' : 'text-rose-400'}>
-            Hit: {pct(d.hit_rate)}
-          </span>
-          <span className="text-slate-400">
-            Prec: {pct(d.precision)}
-          </span>
-          <span className="text-slate-400">
-            Rec: {pct(d.recall)}
-          </span>
-          <span className="text-slate-400">
-            F1: {pct(d.f1)}
-          </span>
+          <span className={hitOk ? 'text-emerald-400' : 'text-rose-400'}>Hit: {pct(d.hit_rate)}</span>
+          <span className="text-slate-400">Prec: {pct(d.precision)}</span>
+          <span className="text-slate-400">Rec: {pct(d.recall)}</span>
+          <span className="text-slate-400">F1: {pct(d.f1)}</span>
         </div>
-        <div className={`text-xs ${aucOk ? 'text-emerald-400' : 'text-rose-400'}`}>
-          AUC: {fmt3(d.auc)}
-        </div>
-        {d.confusion && (
-          <>
-            <ConfusionBar cm={d.confusion} />
-            <ConfusionGrid cm={d.confusion} />
-          </>
-        )}
+        <div className={`text-xs ${aucOk ? 'text-emerald-400' : 'text-rose-400'}`}>AUC: {fmt3(d.auc)}</div>
+        {d.confusion && <><ConfusionBar cm={d.confusion} /><ConfusionGrid cm={d.confusion} /></>}
       </CardContent>
     </Card>
   )
@@ -527,8 +723,6 @@ function ModelDirectionCard({ name, m }: { name: string; m: PriceForecastModelMe
 
 function AmplitudeCard({ name, m }: { name: string; m: PriceForecastModelMetrics }) {
   const a = m.amplitude
-  const icOk = !isNaN(a.ic) && a.ic > 0
-  const rankOk = !isNaN(a.rank_ic) && a.rank_ic > 0
   return (
     <Card>
       <CardHeader className="pb-1">
@@ -539,18 +733,10 @@ function AmplitudeCard({ name, m }: { name: string; m: PriceForecastModelMetrics
       </CardHeader>
       <CardContent className="space-y-1 pt-0">
         <div className="grid grid-cols-2 gap-x-2 text-xs">
-          <span className={icOk ? 'text-emerald-400' : 'text-rose-400'}>
-            IC: {fmt4(a.ic)}
-          </span>
-          <span className={rankOk ? 'text-emerald-400' : 'text-rose-400'}>
-            Rank IC: {fmt4(a.rank_ic)}
-          </span>
-          <span className="text-slate-400">
-            MAE: {fmt4(a.mae)}
-          </span>
-          <span className="text-slate-400">
-            MSE: {fmt4(a.mse)}
-          </span>
+          <span className={!isNaN(a.ic) && a.ic > 0 ? 'text-emerald-400' : 'text-rose-400'}>IC: {fmt4(a.ic)}</span>
+          <span className={!isNaN(a.rank_ic) && a.rank_ic > 0 ? 'text-emerald-400' : 'text-rose-400'}>Rank IC: {fmt4(a.rank_ic)}</span>
+          <span className="text-slate-400">MAE: {fmt4(a.mae)}</span>
+          <span className="text-slate-400">MSE: {fmt4(a.mse)}</span>
         </div>
       </CardContent>
     </Card>
