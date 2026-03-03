@@ -16,6 +16,7 @@ export default defineConfig({
       '/vol-eval': 'http://localhost:8000',
       '/price-forecast': 'http://localhost:8000',
       '/co-mov': 'http://localhost:8000',
+      '/regime-detection': 'http://localhost:8000',
     },
   },
 })

@@ -5,7 +5,8 @@
       "Bash(python:*)",
       "Bash(npm install:*)",
       "Bash(npm run:*)",
-      "Bash(npx tsc:*)"
+      "Bash(npx tsc:*)",
+      "Bash(grep:*)"
     ]
   }
 }

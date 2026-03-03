@@ -11,6 +11,7 @@ from back_api.routers import backtest as backtest_router
 from back_api.routers import co_mov as co_mov_router
 from back_api.routers import evaluation as evaluation_router
 from back_api.routers import price_forecast as price_forecast_router
+from back_api.routers import regime_detection as regime_detection_router
 from back_api.routers import vol_eval as vol_eval_router
 
 
@@ -35,6 +36,7 @@ app.include_router(evaluation_router.router, prefix="/evaluation", tags=["evalua
 app.include_router(vol_eval_router.router, prefix="/vol-eval", tags=["vol-eval"])
 app.include_router(price_forecast_router.router, prefix="/price-forecast", tags=["price-forecast"])
 app.include_router(co_mov_router.router, prefix="/co-mov", tags=["co-mov"])
+app.include_router(regime_detection_router.router, prefix="/regime-detection", tags=["regime"])
 
 
 @app.get("/health", tags=["meta"])

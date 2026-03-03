@@ -5,6 +5,7 @@ import { EvaluationPage } from '@/pages/Evaluation'
 import { VolEvalPage } from '@/pages/VolEval'
 import { PriceForecastPage } from '@/pages/PriceForecast'
 import { CoMovPage } from '@/pages/CoMov'
+import { RegimeDetectionPage } from '@/pages/RegimeDetection'
 
 export default function App() {
   return (
@@ -15,6 +16,7 @@ export default function App() {
         <Route path="/vol-eval" element={<VolEvalPage />} />
         <Route path="/price-forecast" element={<PriceForecastPage />} />
         <Route path="/co-mov" element={<CoMovPage />} />
+        <Route path="/regime-detection" element={<RegimeDetectionPage />} />
       </Route>
     </Routes>
   )

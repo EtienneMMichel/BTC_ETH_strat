@@ -7,6 +7,7 @@ const links = [
   { to: '/vol-eval', label: 'Vol Eval' },
   { to: '/price-forecast', label: 'Price Forecast' },
   { to: '/co-mov', label: 'Co-Movement' },
+  { to: '/regime-detection', label: 'Regime' },
 ]
 
 export function Sidebar() {
