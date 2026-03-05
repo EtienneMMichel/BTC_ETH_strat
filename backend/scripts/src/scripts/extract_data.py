@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
-YEARS   = [2022, 2023, 2024]
+YEARS   = [2022, 2023, 2024,2025,2026]
 MONTHS  = range(1, 13)
 RAW     = Path("../data/raw")
 
@@ -15,7 +15,7 @@ errors = []
 from pathlib import Path
 
 
-from .data.downloader import *
+from .data.downloader import download_candles, download_funding
 
 
 for sym in SYMBOLS:

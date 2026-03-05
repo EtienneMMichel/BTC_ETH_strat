@@ -16,6 +16,7 @@ export interface RegimeDetectionRequest {
   end_date?: string
   models: ModelConfig[]
   prob_window: number
+  save_models?: boolean
 }
 
 export interface RegimeModelResult {
@@ -40,4 +41,12 @@ export interface RegimeDetectionJobResponse {
   status: JobStatus
   result?: RegimeDetectionResult
   error?: string
+}
+
+export interface SavedModelMeta {
+  name: string
+  model_type: string
+  model_id: string
+  saved_at: string
+  params: Record<string, unknown>
 }

@@ -1,6 +1,7 @@
 import { useState, useMemo } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { submitPriceForecast, getPriceForecastJob, getPriceForecastDataRange } from '@/lib/api/models'
+import { submitERCovEval, getERCovEvalJob } from '@/lib/api/markowitz'
 import { MultiLineChart } from '@/components/charts/MultiLineChart'
 import { RocCurveChart } from '@/components/charts/RocCurveChart'
 import { CalibrationChart } from '@/components/charts/CalibrationChart'
@@ -13,19 +14,25 @@ import { AssetTabs } from '@/components/price-forecast/AssetTabs'
 import { SaveRunDialog } from '@/components/price-forecast/SaveRunDialog'
 import { SavedRunsPanel } from '@/components/price-forecast/SavedRunsPanel'
 import { RegimeConditioningPanel } from '@/components/price-forecast/RegimeConditioningPanel'
+import { EyeButton } from '@/components/ui/EyeButton'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
 import { StatusBadge } from '@/components/backtest/StatusBadge'
 import { JobProgressBar } from '@/components/ui/progress'
+import { ER_COLORS } from '@/lib/constants/markowitz-colors'
 import type {
   PriceForecastRequest,
   PriceForecastResult,
   PerAssetForecastData,
   ConfusionMatrix,
   PriceForecastModelMetrics,
+  AmplitudeMetrics,
+  DirectionMetrics,
+  AdditionalMetrics,
   RegimeClassifierType,
 } from '@/types/models'
+import type { ERCovEvalResult } from '@/types/markowitz'
 
 // ── Constants ─────────────────────────────────────────────────────────────
 
@@ -84,6 +91,51 @@ function normalizeResult(res: PriceForecastResult): PriceForecastResult {
     regime_labels: res.regime_labels,
     regime_metrics: res.regime_metrics,
   }
+}
+
+// ── averageMetrics: average PriceForecastModelMetrics across regimes ───────
+
+function averageMetrics(slices: PriceForecastModelMetrics[]): PriceForecastModelMetrics {
+  if (slices.length === 1) return slices[0]
+  const n = slices.length
+  const mean = (vals: number[]) => vals.reduce((s, v) => s + v, 0) / n
+
+  const direction: DirectionMetrics = {
+    hit_rate:  mean(slices.map((s) => s.direction.hit_rate)),
+    precision: mean(slices.map((s) => s.direction.precision)),
+    recall:    mean(slices.map((s) => s.direction.recall)),
+    f1:        mean(slices.map((s) => s.direction.f1)),
+    auc:       mean(slices.map((s) => s.direction.auc)),
+    roc_curve: slices[0].direction.roc_curve,
+    confusion: {
+      tp: slices.reduce((s, m) => s + m.direction.confusion.tp, 0),
+      fp: slices.reduce((s, m) => s + m.direction.confusion.fp, 0),
+      tn: slices.reduce((s, m) => s + m.direction.confusion.tn, 0),
+      fn: slices.reduce((s, m) => s + m.direction.confusion.fn, 0),
+    },
+  }
+
+  const hasBrier = slices[0].amplitude.brier_score != null
+  const hasLogLoss = slices[0].amplitude.log_loss != null
+
+  const amplitude: AmplitudeMetrics = {
+    ic:       mean(slices.map((s) => s.amplitude.ic)),
+    rank_ic:  mean(slices.map((s) => s.amplitude.rank_ic)),
+    mae:      mean(slices.map((s) => s.amplitude.mae)),
+    mse:      mean(slices.map((s) => s.amplitude.mse)),
+    calibration_bins: slices[0].amplitude.calibration_bins,
+    reliability_diagram: slices[0].amplitude.reliability_diagram,
+    brier_score: hasBrier ? mean(slices.map((s) => s.amplitude.brier_score ?? 0)) : undefined,
+    log_loss:    hasLogLoss ? mean(slices.map((s) => s.amplitude.log_loss ?? 0)) : undefined,
+  }
+
+  const additional: AdditionalMetrics = {
+    turnover:         mean(slices.map((s) => s.additional.turnover)),
+    signal_histogram: slices[0].additional.signal_histogram,
+    acf:              slices[0].additional.acf,
+  }
+
+  return { direction, amplitude, additional, output_type: slices[0].output_type }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -213,8 +265,21 @@ function RegimeFilter({
 // ── Page ──────────────────────────────────────────────────────────────────
 
 type AssetMode = 'BTC' | 'ETH' | 'Both'
+type TopTab = 'forecast' | 'er'
 
 export function PriceForecastPage() {
+  const [topTab, setTopTab] = useState<TopTab>('forecast')
+
+  // ── Expected Returns state ──
+  const [erModels, setErModels] = useState<string[]>(['rolling_mean', 'signal_tsmom'])
+  const [erFreq, setErFreq] = useState('1D')
+  const [erWindow, setErWindow] = useState(63)
+  const [erMinHistory, setErMinHistory] = useState(100)
+  const [erJobId, setErJobId] = useState<string | null>(null)
+  const [isErSubmitting, setIsErSubmitting] = useState(false)
+  const [hiddenEr, setHiddenEr] = useState<Set<string>>(new Set())
+  const [activeErAsset, setActiveErAsset] = useState<'BTC' | 'ETH'>('BTC')
+
   const [assetMode, setAssetMode] = useState<AssetMode>('BTC')
   const [crossAsset, setCrossAsset] = useState(false)
   const [horizon, setHorizon] = useState('1D')
@@ -243,6 +308,9 @@ export function PriceForecastPage() {
 
   const [activeAsset, setActiveAsset] = useState<string>('BTC')
 
+  // Feature 2 — hidden signals
+  const [hiddenSignals, setHiddenSignals] = useState<Set<string>>(new Set())
+
   const { data: dataRanges } = useQuery({
     queryKey: ['price-forecast-data-range'],
     queryFn: getPriceForecastDataRange,
@@ -264,6 +332,7 @@ export function PriceForecastPage() {
   const handleSubmit = async () => {
     setSavedResult(null)
     setSelectedRegimes([])
+    setHiddenSignals(new Set())
     setIsSubmitting(true)
     try {
       const req: PriceForecastRequest = {
@@ -308,6 +377,57 @@ export function PriceForecastPage() {
     setTrainStart(ts); setTrainEnd(te); setTestStart(ss); setTestEnd(se)
   }
 
+  // ── ER query ──
+  const { data: erJob } = useQuery({
+    queryKey: ['er-eval', erJobId],
+    queryFn: () => getERCovEvalJob(erJobId!),
+    enabled: !!erJobId,
+    refetchInterval: (q) =>
+      q.state.data?.status === 'done' || q.state.data?.status === 'failed' ? false : 2000,
+  })
+
+  const handleErSubmit = async () => {
+    setIsErSubmitting(true)
+    setHiddenEr(new Set())
+    try {
+      const { job_id } = await submitERCovEval({
+        freq: erFreq,
+        models: erModels,
+        er_window: erWindow,
+        min_history: erMinHistory,
+      })
+      setErJobId(job_id)
+    } finally {
+      setIsErSubmitting(false)
+    }
+  }
+
+  const toggleErModel = (m: string) =>
+    setErModels((prev) => prev.includes(m) ? prev.filter((x) => x !== m) : [...prev, m])
+
+  const toggleHiddenEr = (name: string) =>
+    setHiddenEr((prev) => { const s = new Set(prev); s.has(name) ? s.delete(name) : s.add(name); return s })
+
+  const erResult: ERCovEvalResult | undefined = erJob?.result as ERCovEvalResult | undefined
+  const erAssetData = erResult?.per_asset?.[activeErAsset]
+  const isErRunning = erJob?.status === 'running' || erJob?.status === 'pending'
+
+  const erMuSeries = useMemo(() => {
+    if (!erAssetData) return []
+    return Object.entries(erAssetData.mu)
+      .filter(([name]) => !hiddenEr.has(name))
+      .map(([name, data]) => ({ data, color: ER_COLORS[name] ?? '#fff', title: name }))
+  }, [erAssetData, hiddenEr])
+
+  const toggleHiddenSignal = (name: string) => {
+    setHiddenSignals((prev) => {
+      const next = new Set(prev)
+      if (next.has(name)) next.delete(name)
+      else next.add(name)
+      return next
+    })
+  }
+
   const rawResult = savedResult ?? (job?.result ?? undefined)
   const result = useMemo(
     () => (rawResult ? normalizeResult(rawResult) : undefined),
@@ -324,34 +444,54 @@ export function PriceForecastPage() {
     [result?.regime_labels]
   )
 
-  // Active metric groups: aggregate or per-regime slices
+  // Active metric groups: averaged single group for multi-regime, otherwise per-regime or all
   const activeMetricGroups = useMemo(() => {
     if (!assetData) return []
     if (selectedRegimes.length === 0 || !result?.regime_metrics) {
       return [{ label: null as string | null, metrics: assetData.metrics }]
     }
     const assetRM = result.regime_metrics[currentAsset] ?? {}
-    return selectedRegimes
-      .map((regime) => ({
-        label: regime,
-        metrics: Object.fromEntries(
-          Object.keys(assetData.metrics)
-            .map((model) => [model, assetRM[model]?.[regime]])
-            .filter(([, m]) => m != null)
-        ) as Record<string, PriceForecastModelMetrics>,
-      }))
-      .filter((g) => Object.keys(g.metrics).length > 0)
+    const modelNames = Object.keys(assetData.metrics)
+
+    if (selectedRegimes.length === 1) {
+      const regime = selectedRegimes[0]
+      const metrics = Object.fromEntries(
+        modelNames
+          .map((model) => [model, assetRM[model]?.[regime]])
+          .filter(([, m]) => m != null)
+      ) as Record<string, PriceForecastModelMetrics>
+      return Object.keys(metrics).length > 0
+        ? [{ label: regime, metrics }]
+        : []
+    }
+
+    // Multiple regimes: average across all selected
+    const avgMetrics: Record<string, PriceForecastModelMetrics> = {}
+    for (const model of modelNames) {
+      const slices = selectedRegimes
+        .map((regime) => assetRM[model]?.[regime])
+        .filter(Boolean) as PriceForecastModelMetrics[]
+      if (slices.length > 0) {
+        avgMetrics[model] = averageMetrics(slices)
+      }
+    }
+    const label = `avg(${selectedRegimes.join(', ')})`
+    return Object.keys(avgMetrics).length > 0
+      ? [{ label, metrics: avgMetrics }]
+      : []
   }, [assetData, result, selectedRegimes, currentAsset])
 
-  // Signal series (always aggregate)
+  // Signal series (always aggregate) — filtered by hiddenSignals
   const signalSeries = useMemo(() => {
     if (!assetData) return []
-    return Object.entries(assetData.signals).map(([name, data]) => ({
-      data,
-      color: MODEL_COLORS[name] ?? '#ffffff',
-      title: `${name}@${assetData.model_resolutions[name] ?? '?'}`,
-    }))
-  }, [assetData])
+    return Object.entries(assetData.signals)
+      .filter(([name]) => !hiddenSignals.has(name))
+      .map(([name, data]) => ({
+        data,
+        color: MODEL_COLORS[name] ?? '#ffffff',
+        title: `${name}@${assetData.model_resolutions[name] ?? '?'}`,
+      }))
+  }, [assetData, hiddenSignals])
 
   // ROC curves — use active metric groups
   const rocCurves = useMemo(() => {
@@ -381,10 +521,33 @@ export function PriceForecastPage() {
     : null
 
   return (
-    <div className="flex gap-6 h-full">
+    <div className="flex flex-col gap-4 h-full">
+      {/* ── Top-level tab bar ── */}
+      <div className="flex gap-1 shrink-0">
+        <button
+          onClick={() => setTopTab('forecast')}
+          className={`px-4 py-1.5 rounded text-sm font-medium transition-colors ${
+            topTab === 'forecast' ? 'bg-sky-700 text-white' : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+          }`}
+        >
+          Price Forecast
+        </button>
+        <button
+          onClick={() => setTopTab('er')}
+          className={`px-4 py-1.5 rounded text-sm font-medium transition-colors ${
+            topTab === 'er' ? 'bg-violet-700 text-white' : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+          }`}
+        >
+          Expected Returns
+        </button>
+      </div>
+
+      {/* ── Forecast tab ── */}
+      {topTab === 'forecast' && (
+      <div className="flex gap-6 flex-1 min-h-0">
       {/* ── Left panel ── */}
       <div className="w-72 shrink-0 flex flex-col gap-4 overflow-y-auto pr-1">
-        <h1 className="text-lg font-semibold text-slate-100">Price Forecast</h1>
+        <h2 className="text-lg font-semibold text-slate-100">Price Forecast</h2>
 
         {/* Asset */}
         <div>
@@ -536,6 +699,11 @@ export function PriceForecastPage() {
                   colorMap={regimeColorMap}
                   onChange={setSelectedRegimes}
                 />
+                {selectedRegimes.length > 1 && (
+                  <p className="text-[10px] text-slate-500">
+                    Multiple regimes selected — metrics averaged across selected regimes.
+                  </p>
+                )}
               </div>
             )}
 
@@ -545,8 +713,8 @@ export function PriceForecastPage() {
               {activeMetricGroups.map((group) => (
                 <div key={group.label ?? '__all__'} className="mb-4">
                   {group.label && (
-                    <h3 className="text-xs font-medium mb-2 flex items-center gap-1.5" style={{ color: regimeColorMap[group.label] }}>
-                      <span className="w-2 h-2 rounded-sm inline-block" style={{ background: regimeColorMap[group.label] }} />
+                    <h3 className="text-xs font-medium mb-2 flex items-center gap-1.5" style={{ color: regimeColorMap[group.label] ?? '#94a3b8' }}>
+                      <span className="w-2 h-2 rounded-sm inline-block" style={{ background: regimeColorMap[group.label] ?? '#94a3b8' }} />
                       {group.label}
                     </h3>
                   )}
@@ -573,8 +741,8 @@ export function PriceForecastPage() {
               {activeMetricGroups.map((group) => (
                 <div key={group.label ?? '__all__'} className="mb-4">
                   {group.label && (
-                    <h3 className="text-xs font-medium mb-2 flex items-center gap-1.5" style={{ color: regimeColorMap[group.label] }}>
-                      <span className="w-2 h-2 rounded-sm inline-block" style={{ background: regimeColorMap[group.label] }} />
+                    <h3 className="text-xs font-medium mb-2 flex items-center gap-1.5" style={{ color: regimeColorMap[group.label] ?? '#94a3b8' }}>
+                      <span className="w-2 h-2 rounded-sm inline-block" style={{ background: regimeColorMap[group.label] ?? '#94a3b8' }} />
                       {group.label}
                     </h3>
                   )}
@@ -631,7 +799,26 @@ export function PriceForecastPage() {
 
             {/* ── Section C: Additional Data ── */}
             <section>
-              <h2 className="text-sm font-semibold text-emerald-400 mb-3">C — Additional Data</h2>
+              {/* Header with per-signal eye toggles */}
+              <div className="flex items-center gap-3 mb-3 flex-wrap">
+                <h2 className="text-sm font-semibold text-emerald-400">C — Additional Data</h2>
+                {Object.keys(assetData.signals).map((name) => (
+                  <button
+                    key={name}
+                    onClick={() => toggleHiddenSignal(name)}
+                    className="flex items-center gap-1 text-[10px] text-slate-400 hover:text-slate-200 transition-colors"
+                    title={hiddenSignals.has(name) ? `Show ${name}` : `Hide ${name}`}
+                  >
+                    <span
+                      className="w-2 h-2 rounded-full"
+                      style={{ background: MODEL_COLORS[name] ?? '#fff', opacity: hiddenSignals.has(name) ? 0.3 : 1 }}
+                    />
+                    <span className={hiddenSignals.has(name) ? 'opacity-40' : ''}>{name}</span>
+                    <span className="text-slate-600">{hiddenSignals.has(name) ? '👁‍🗨' : '👁'}</span>
+                  </button>
+                ))}
+              </div>
+
               {signalSeries.length > 0 && selectedRegimes.length === 0 && (
                 <div className="mb-4">
                   <p className="text-xs text-slate-500 mb-1">Signals (at model resolution)</p>
@@ -641,8 +828,8 @@ export function PriceForecastPage() {
               {activeMetricGroups.map((group) => (
                 <div key={group.label ?? '__all__'} className="mb-4">
                   {group.label && (
-                    <h3 className="text-xs font-medium mb-2 flex items-center gap-1.5" style={{ color: regimeColorMap[group.label] }}>
-                      <span className="w-2 h-2 rounded-sm inline-block" style={{ background: regimeColorMap[group.label] }} />
+                    <h3 className="text-xs font-medium mb-2 flex items-center gap-1.5" style={{ color: regimeColorMap[group.label] ?? '#94a3b8' }}>
+                      <span className="w-2 h-2 rounded-sm inline-block" style={{ background: regimeColorMap[group.label] ?? '#94a3b8' }} />
                       {group.label}
                     </h3>
                   )}
@@ -686,6 +873,161 @@ export function PriceForecastPage() {
           </div>
         )}
       </div>
+      </div>
+      )}
+
+      {/* ── Expected Returns tab ── */}
+      {topTab === 'er' && (
+        <div className="flex gap-6 flex-1 min-h-0">
+          {/* Left panel */}
+          <div className="w-72 shrink-0 flex flex-col gap-4 overflow-y-auto pr-1">
+            <h2 className="text-lg font-semibold text-slate-100">Expected Returns Evaluation</h2>
+
+            <div>
+              <Label className="mb-2 block">Models</Label>
+              {(['rolling_mean', 'signal_tsmom'] as const).map((m) => (
+                <label key={m} className="flex items-center gap-2 cursor-pointer mb-1">
+                  <input
+                    type="checkbox"
+                    checked={erModels.includes(m)}
+                    onChange={() => toggleErModel(m)}
+                    className="accent-violet-500"
+                  />
+                  <span className="text-sm text-slate-300 flex items-center gap-2">
+                    <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ background: ER_COLORS[m] }} />
+                    {m}
+                  </span>
+                </label>
+              ))}
+            </div>
+
+            <div>
+              <Label className="mb-2 block">Frequency</Label>
+              {['1D', '4h', '1h'].map((f) => (
+                <label key={f} className="flex items-center gap-2 cursor-pointer mb-1">
+                  <input type="radio" name="er-freq" checked={erFreq === f} onChange={() => setErFreq(f)} className="accent-violet-500" />
+                  <span className="text-sm text-slate-300">{f}</span>
+                </label>
+              ))}
+            </div>
+
+            <div>
+              <Label className="mb-1 block">ER window: {erWindow}</Label>
+              <input
+                type="range" min={5} max={126} step={1}
+                value={erWindow} onChange={(e) => setErWindow(Number(e.target.value))}
+                className="w-full accent-violet-500"
+              />
+            </div>
+
+            <div>
+              <Label className="mb-1 block">Min history: {erMinHistory}</Label>
+              <input
+                type="range" min={10} max={500} step={10}
+                value={erMinHistory} onChange={(e) => setErMinHistory(Number(e.target.value))}
+                className="w-full accent-violet-500"
+              />
+            </div>
+
+            <Button
+              onClick={handleErSubmit}
+              disabled={isErSubmitting || isErRunning || erModels.length === 0}
+              className="bg-violet-700 hover:bg-violet-600 text-white"
+            >
+              Run
+            </Button>
+
+            {erJob && (
+              <div className="space-y-2">
+                <div className="flex items-center gap-2">
+                  <span className="text-sm text-slate-400">Status:</span>
+                  <StatusBadge status={erJob.status} />
+                </div>
+                <JobProgressBar status={erJob.status} />
+              </div>
+            )}
+            {erJob?.error && <p className="text-sm text-rose-400">{erJob.error}</p>}
+          </div>
+
+          {/* Right panel */}
+          <div className="flex-1 flex flex-col gap-6 min-w-0 overflow-y-auto">
+            {erResult ? (
+              <>
+                {/* Asset tabs */}
+                <div className="flex gap-1">
+                  {(['BTC', 'ETH'] as const).map((a) => (
+                    <button
+                      key={a}
+                      onClick={() => setActiveErAsset(a)}
+                      className={`px-3 py-1 rounded text-sm font-medium transition-colors ${
+                        activeErAsset === a
+                          ? 'bg-violet-700 text-white'
+                          : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+                      }`}
+                    >
+                      {a}
+                    </button>
+                  ))}
+                </div>
+
+                {erAssetData && (
+                  <>
+                    <div>
+                      <h2 className="text-sm font-medium text-slate-400 mb-2">Expected Returns — {activeErAsset}</h2>
+                      <MultiLineChart series={erMuSeries} height={280} />
+                    </div>
+
+                    {/* Metrics table */}
+                    <div>
+                      <h2 className="text-sm font-medium text-slate-400 mb-2">Model Metrics — {activeErAsset}</h2>
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-sm text-slate-300 border-collapse">
+                          <thead>
+                            <tr className="border-b border-slate-700 text-slate-500 text-xs">
+                              <th className="text-left py-2 pr-4">Model</th>
+                              <th className="text-right py-2 px-3">IC</th>
+                              <th className="text-right py-2 px-3">Hit Rate</th>
+                              <th className="py-2 px-2 w-8"></th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {Object.entries(erAssetData.metrics).map(([name, m]) => (
+                              <tr key={name} className="border-b border-slate-800">
+                                <td className="py-2 pr-4">
+                                  <div className="flex items-center gap-2">
+                                    <span
+                                      className="inline-block w-2.5 h-2.5 rounded-full shrink-0"
+                                      style={{ background: ER_COLORS[name] ?? '#fff', opacity: hiddenEr.has(name) ? 0.3 : 1 }}
+                                    />
+                                    <span className={hiddenEr.has(name) ? 'opacity-40' : ''}>{name}</span>
+                                  </div>
+                                </td>
+                                <td className={`text-right px-3 ${m.ic > 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                                  {m.ic.toFixed(4)}
+                                </td>
+                                <td className={`text-right px-3 ${m.hit_rate >= 0.5 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                                  {(m.hit_rate * 100).toFixed(1)}%
+                                </td>
+                                <td className="px-2 text-center">
+                                  <EyeButton visible={!hiddenEr.has(name)} onToggle={() => toggleHiddenEr(name)} />
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  </>
+                )}
+              </>
+            ) : (
+              <div className="flex-1 flex items-center justify-center text-slate-600 text-sm">
+                Configure and run an expected-returns evaluation to see results.
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   )
 }

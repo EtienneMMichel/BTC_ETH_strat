@@ -17,6 +17,8 @@ interface PriceVolumeChartProps {
   ethClose: TimeSeries
   btcVolume: TimeSeries
   ethVolume: TimeSeries
+  displayMode?: 'price' | 'return'
+  onChartMargins?: (left: number, right: number) => void
 }
 
 function toLineData(ts: TimeSeries) {
@@ -26,7 +28,25 @@ function toLineData(ts: TimeSeries) {
     .filter((item, idx, arr) => idx === 0 || item.time !== arr[idx - 1].time)
 }
 
-export function PriceVolumeChart({ btcClose, ethClose, btcVolume, ethVolume }: PriceVolumeChartProps) {
+function toCumRetData(ts: TimeSeries) {
+  const sorted = [...ts]
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([time, value]) => ({ time: time.slice(0, 10) as Time, value }))
+    .filter((item, idx, arr) => idx === 0 || item.time !== arr[idx - 1].time)
+  if (sorted.length === 0) return []
+  const v0 = sorted[0].value
+  if (v0 === 0) return sorted
+  return sorted.map((p) => ({ time: p.time, value: (p.value / v0 - 1) * 100 }))
+}
+
+export function PriceVolumeChart({
+  btcClose,
+  ethClose,
+  btcVolume,
+  ethVolume,
+  displayMode = 'return',
+  onChartMargins,
+}: PriceVolumeChartProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const chartRef = useRef<IChartApi | null>(null)
   const btcLineRef = useRef<ISeriesApi<SeriesType> | null>(null)
@@ -107,23 +127,51 @@ export function PriceVolumeChart({ btcClose, ethClose, btcVolume, ethVolume }: P
 
   // Data updates
   useEffect(() => {
-    btcLineRef.current?.setData(toLineData(btcClose))
-    ethLineRef.current?.setData(toLineData(ethClose))
+    const converter = displayMode === 'return' ? toCumRetData : toLineData
+    btcLineRef.current?.setData(converter(btcClose))
+    ethLineRef.current?.setData(converter(ethClose))
     btcVolRef.current?.setData(toLineData(btcVolume))
     ethVolRef.current?.setData(toLineData(ethVolume))
     chartRef.current?.timeScale().fitContent()
-  }, [btcClose, ethClose, btcVolume, ethVolume])
+
+    if (!onChartMargins || !containerRef.current) return
+
+    const allData = converter(btcClose)
+    if (allData.length === 0) return
+
+    const timer = setTimeout(() => {
+      const chart = chartRef.current
+      const container = containerRef.current
+      if (!chart || !container) return
+      const timeScale = chart.timeScale()
+      const containerWidth = container.clientWidth
+      const firstTime = allData[0].time
+      const lastTime = allData[allData.length - 1].time
+      const x0 = timeScale.timeToCoordinate(firstTime)
+      const xN = timeScale.timeToCoordinate(lastTime)
+      if (x0 == null || xN == null) return
+      const n = allData.length
+      const step = n > 1 ? (xN - x0) / (n - 1) : 0
+      const leftPad = Math.max(0, x0 - step / 2)
+      const rightPad = Math.max(0, containerWidth - xN - step / 2)
+      onChartMargins(leftPad, rightPad)
+    }, 50)
+
+    return () => clearTimeout(timer)
+  }, [btcClose, ethClose, btcVolume, ethVolume, displayMode, onChartMargins])
+
+  const isReturn = displayMode === 'return'
 
   return (
     <div className="space-y-1">
       <div className="flex gap-4 text-xs text-slate-400 px-1">
         <span className="flex items-center gap-1">
           <span className="inline-block w-3 h-0.5 bg-orange-500" />
-          BTC close
+          {isReturn ? 'BTC cumul. %' : 'BTC close'}
         </span>
         <span className="flex items-center gap-1">
           <span className="inline-block w-3 h-0.5 bg-sky-400" />
-          ETH close
+          {isReturn ? 'ETH cumul. %' : 'ETH close'}
         </span>
         <span className="flex items-center gap-1">
           <span className="inline-block w-3 h-2 bg-orange-500/35 rounded-sm" />

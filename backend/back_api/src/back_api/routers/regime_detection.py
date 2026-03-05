@@ -2,12 +2,18 @@
 Regime Detection router.
 
 POST /regime-detection/run  → {job_id}
+GET  /regime-detection/saved-models → list of SavedModelMeta
+DELETE /regime-detection/saved-models/{name} → 204
 GET  /regime-detection/{job_id} → RegimeDetectionJobResponse
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
+import pickle
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -19,6 +25,7 @@ from back_api.jobs import JobStore
 from back_api.schemas.regime_detection import (
     RegimeDetectionJobResponse,
     RegimeDetectionRequest,
+    SavedModelMeta,
 )
 
 router = APIRouter()
@@ -37,6 +44,13 @@ _DEFAULT_SYMBOLS = {
 
 def _get_store(request: Request) -> JobStore:
     return request.app.state.job_store
+
+
+def _saved_models_dir() -> Path:
+    settings = get_settings()
+    d = Path(settings.data_dir).parent / "saved_models"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 def _series_to_ts(s: pd.Series) -> list[tuple[str, float]]:
@@ -73,6 +87,22 @@ def _rolling_freq_proba(
     return result
 
 
+def _save_model(clf: Any, model_id: str, model_type: str, params: dict) -> None:
+    """Pickle classifier and write metadata sidecar."""
+    d = _saved_models_dir()
+    with open(d / f"{model_id}.pkl", "wb") as fh:
+        pickle.dump(clf, fh)
+    meta = {
+        "name": model_id,
+        "model_type": model_type,
+        "model_id": model_id,
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "params": params,
+    }
+    with open(d / f"{model_id}.json", "w") as fh:
+        json.dump(meta, fh)
+
+
 # ---------------------------------------------------------------------------
 # Per-model processing
 # ---------------------------------------------------------------------------
@@ -83,7 +113,9 @@ def _process_threshold(
     close_eth: pd.Series,
     params: dict,
     prob_window: int,
-) -> tuple[pd.Series, dict[str, list[tuple[str, float]]]]:
+    save_models: bool = False,
+    model_id: str = "",
+) -> tuple[pd.Series, dict[str, list[tuple[str, float]]], list[str]]:
     """Run RegimeClassifier on BTC+ETH prices → hard labels + rolling proba."""
     from core.strats.orchestrator.regime import RegimeClassifier
 
@@ -99,6 +131,10 @@ def _process_threshold(
     labels = classifier.classify(prices)
     unique_regimes = sorted(labels.unique().tolist())
     proba = _rolling_freq_proba(labels, unique_regimes, prob_window)
+
+    if save_models and model_id:
+        _save_model(classifier, model_id, "threshold", params)
+
     return labels, proba, unique_regimes
 
 
@@ -106,7 +142,7 @@ def _process_vol_quantile(
     close: pd.Series,
     params: dict,
     prob_window: int,
-) -> tuple[pd.Series, dict[str, list[tuple[str, float]]]]:
+) -> tuple[pd.Series, dict[str, list[tuple[str, float]]], list[str]]:
     """Rolling-vol quantile binning → hard labels + rolling proba."""
     n_regimes = params.get("n_regimes", 2)
     vol_window = params.get("vol_window", 21)
@@ -134,7 +170,9 @@ def _process_hmm(
     close_eth: pd.Series,
     params: dict,
     _prob_window: int,
-) -> tuple[pd.Series, dict[str, list[tuple[str, float]]]]:
+    save_models: bool = False,
+    model_id: str = "",
+) -> tuple[pd.Series, dict[str, list[tuple[str, float]]], list[str]]:
     """Fit HMMRegimeClassifier → Viterbi labels + forward-backward posteriors."""
     from core.strats.orchestrator.hmm import HMMRegimeClassifier
 
@@ -154,6 +192,9 @@ def _process_hmm(
     proba: dict[str, list[tuple[str, float]]] = {}
     for regime in unique_regimes:
         proba[regime] = _proba_to_ts(proba_df[regime])
+
+    if save_models and model_id:
+        _save_model(clf, model_id, "hmm", params)
 
     return labels, proba, unique_regimes
 
@@ -223,7 +264,8 @@ def _run_regime_detection_sync(req: RegimeDetectionRequest) -> dict[str, Any]:
         try:
             if mc.model_type == "threshold":
                 labels, proba, unique_regimes = _process_threshold(
-                    close_btc, close_eth, mc.params, req.prob_window
+                    close_btc, close_eth, mc.params, req.prob_window,
+                    save_models=req.save_models, model_id=mc.model_id,
                 )
             elif mc.model_type == "vol_quantile":
                 # Use BTC close as primary asset for vol_quantile
@@ -232,7 +274,8 @@ def _run_regime_detection_sync(req: RegimeDetectionRequest) -> dict[str, Any]:
                 )
             elif mc.model_type == "hmm":
                 labels, proba, unique_regimes = _process_hmm(
-                    close_btc, close_eth, mc.params, req.prob_window
+                    close_btc, close_eth, mc.params, req.prob_window,
+                    save_models=req.save_models, model_id=mc.model_id,
                 )
             else:
                 continue
@@ -269,7 +312,7 @@ def _run_regime_detection_sync(req: RegimeDetectionRequest) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Endpoints
+# Endpoints — NOTE: specific routes must come before /{job_id}
 # ---------------------------------------------------------------------------
 
 
@@ -284,6 +327,35 @@ async def run_regime_detection(
         store.run(job_id, asyncio.to_thread(_run_regime_detection_sync, req))
     )
     return {"job_id": job_id}
+
+
+@router.get("/saved-models", response_model=list[SavedModelMeta])
+async def list_saved_models() -> list[SavedModelMeta]:
+    """List pickled regime classifiers saved to disk."""
+    d = _saved_models_dir()
+    results: list[SavedModelMeta] = []
+    for pkl_path in sorted(d.glob("*.pkl")):
+        json_path = pkl_path.with_suffix(".json")
+        if json_path.exists():
+            try:
+                with open(json_path) as fh:
+                    meta = json.load(fh)
+                results.append(SavedModelMeta(**meta))
+            except Exception:
+                pass
+    return results
+
+
+@router.delete("/saved-models/{name}", status_code=204)
+async def delete_saved_model(name: str) -> None:
+    """Delete a pickled regime classifier and its metadata."""
+    d = _saved_models_dir()
+    pkl_path = d / f"{name}.pkl"
+    json_path = d / f"{name}.json"
+    if not pkl_path.exists():
+        raise HTTPException(status_code=404, detail=f"Model '{name}' not found.")
+    pkl_path.unlink(missing_ok=True)
+    json_path.unlink(missing_ok=True)
 
 
 @router.get("/{job_id}", response_model=RegimeDetectionJobResponse)

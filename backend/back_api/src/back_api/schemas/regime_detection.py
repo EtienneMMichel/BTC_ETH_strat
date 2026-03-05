@@ -18,6 +18,7 @@ class RegimeDetectionRequest(BaseModel):
     end_date: str | None = None
     models: list[ModelConfig] = []
     prob_window: int = 20
+    save_models: bool = False
 
 
 class RegimeModelResult(BaseModel):
@@ -42,3 +43,11 @@ class RegimeDetectionJobResponse(BaseModel):
     status: str
     result: dict | None = None
     error: str | None = None
+
+
+class SavedModelMeta(BaseModel):
+    name: str
+    model_type: str
+    model_id: str
+    saved_at: str
+    params: dict

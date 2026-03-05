@@ -10,7 +10,7 @@ requires-python = ">=3.13"
 dependencies = [
     "polars>=1.0",
     "requests>=2.32",
-    "core @ {path = \"../core\"}",
+    "core @ file:///C:/Users/etien/FinUni/divers/BTC_ETH_strat/backend/core",
 ]
 
 [tool.poetry]

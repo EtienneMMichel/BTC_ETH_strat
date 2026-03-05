@@ -1,6 +1,11 @@
-import { useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
-import { submitRegimeDetection, getRegimeDetectionJob } from '@/lib/api/regime_detection'
+import { useCallback, useState } from 'react'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import {
+  submitRegimeDetection,
+  getRegimeDetectionJob,
+  listSavedModels,
+  deleteSavedModel,
+} from '@/lib/api/regime_detection'
 import { PriceVolumeChart } from '@/components/charts/PriceVolumeChart'
 import { RegimeRow } from '@/components/charts/RegimeRow'
 import { Button } from '@/components/ui/button'
@@ -35,11 +40,17 @@ export function RegimeDetectionPage() {
   const [endDate, setEndDate] = useState('')
   const [models, setModels] = useState<ModelConfig[]>(DEFAULT_MODELS)
   const [probWindow, setProbWindow] = useState(20)
+  const [saveModels, setSaveModels] = useState(false)
 
   // UI state
   const [mode, setMode] = useState<'max' | 'prob'>('max')
+  const [displayMode, setDisplayMode] = useState<'price' | 'return'>('return')
+  const [chartMargins, setChartMargins] = useState({ left: 0, right: 0 })
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [jobId, setJobId] = useState<string | null>(null)
+  const [savedModelsOpen, setSavedModelsOpen] = useState(false)
+
+  const queryClient = useQueryClient()
 
   // Polling
   const { data: job } = useQuery({
@@ -48,6 +59,18 @@ export function RegimeDetectionPage() {
     enabled: !!jobId,
     refetchInterval: (q) =>
       q.state.data?.status === 'done' || q.state.data?.status === 'failed' ? false : 2000,
+  })
+
+  // Saved models list
+  const { data: savedModelsList } = useQuery({
+    queryKey: ['regime-detection-saved-models'],
+    queryFn: listSavedModels,
+    enabled: savedModelsOpen,
+  })
+
+  const deleteMutation = useMutation({
+    mutationFn: (name: string) => deleteSavedModel(name),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['regime-detection-saved-models'] }),
   })
 
   const result: RegimeDetectionResult | undefined = job?.result
@@ -63,12 +86,20 @@ export function RegimeDetectionPage() {
         end_date: endDate || undefined,
         models,
         prob_window: probWindow,
+        save_models: saveModels,
       })
       setJobId(job_id)
+      if (saveModels) {
+        queryClient.invalidateQueries({ queryKey: ['regime-detection-saved-models'] })
+      }
     } finally {
       setIsSubmitting(false)
     }
   }
+
+  const handleChartMargins = useCallback((left: number, right: number) => {
+    setChartMargins({ left, right })
+  }, [])
 
   // Model list editing helpers
   const addModel = () => {
@@ -87,7 +118,6 @@ export function RegimeDetectionPage() {
   }
 
   const updateModelParam = (idx: number, key: string, rawValue: string) => {
-    // Try to parse number, fall back to string
     const value = rawValue === '' ? undefined : isNaN(Number(rawValue)) ? rawValue : Number(rawValue)
     setModels((prev) =>
       prev.map((m, i) =>
@@ -255,6 +285,20 @@ export function RegimeDetectionPage() {
           </div>
         </div>
 
+        {/* Save models checkbox */}
+        <div className="flex items-center gap-2">
+          <input
+            type="checkbox"
+            id="save-models"
+            checked={saveModels}
+            onChange={(e) => setSaveModels(e.target.checked)}
+            className="accent-sky-500"
+          />
+          <Label htmlFor="save-models" className="text-xs text-slate-300 cursor-pointer">
+            Save fitted models to disk
+          </Label>
+        </div>
+
         {/* Run button */}
         <Button
           onClick={handleSubmit}
@@ -274,6 +318,45 @@ export function RegimeDetectionPage() {
             )}
           </div>
         )}
+
+        {/* Saved Models section */}
+        <div className="border border-slate-700 rounded">
+          <button
+            onClick={() => setSavedModelsOpen((o) => !o)}
+            className="w-full flex items-center justify-between px-3 py-2 text-xs text-slate-400 hover:text-slate-200"
+          >
+            <span className="font-medium">Saved Models</span>
+            <span>{savedModelsOpen ? '▲' : '▼'}</span>
+          </button>
+          {savedModelsOpen && (
+            <div className="border-t border-slate-700 p-2 space-y-1 max-h-48 overflow-y-auto">
+              {!savedModelsList || savedModelsList.length === 0 ? (
+                <p className="text-[10px] text-slate-600 text-center py-2">No saved models</p>
+              ) : (
+                savedModelsList.map((sm) => (
+                  <div
+                    key={sm.name}
+                    className="flex items-center justify-between gap-1 text-[10px] text-slate-400 py-0.5"
+                  >
+                    <div className="min-w-0">
+                      <span className="text-slate-300 font-medium truncate block">{sm.name}</span>
+                      <span className="text-slate-600">
+                        {sm.model_type} · {sm.saved_at.slice(0, 10)}
+                      </span>
+                    </div>
+                    <button
+                      onClick={() => deleteMutation.mutate(sm.name)}
+                      className="shrink-0 text-[10px] px-1.5 py-0.5 rounded hover:bg-red-900 text-slate-500 hover:text-red-300"
+                      title="Delete"
+                    >
+                      ×
+                    </button>
+                  </div>
+                ))
+              )}
+            </div>
+          )}
+        </div>
       </aside>
 
       {/* ── Right panel ── */}
@@ -284,6 +367,15 @@ export function RegimeDetectionPage() {
             {result ? `${result.freq} · ${result.date_range[0]?.slice(0, 10)} – ${result.date_range[1]?.slice(0, 10)}` : 'Regime Timeline'}
           </div>
           <div className="flex gap-1 items-center">
+            {/* Price / Return toggle */}
+            <button
+              onClick={() => setDisplayMode(displayMode === 'price' ? 'return' : 'price')}
+              className="px-2 py-1 text-xs rounded transition-colors bg-slate-800 text-slate-400 hover:bg-slate-700 mr-2"
+              title="Toggle between raw price and cumulated returns"
+            >
+              {displayMode === 'return' ? 'Return %' : 'Price'}
+            </button>
+
             {mode === 'prob' && (
               <span className="text-[10px] text-slate-500 mr-2">prob window: {probWindow}</span>
             )}
@@ -318,6 +410,8 @@ export function RegimeDetectionPage() {
               ethClose={result.prices['ETH'] ?? []}
               btcVolume={result.volumes['BTC'] ?? []}
               ethVolume={result.volumes['ETH'] ?? []}
+              displayMode={displayMode}
+              onChartMargins={handleChartMargins}
             />
 
             {/* Regime strips */}
@@ -336,6 +430,8 @@ export function RegimeDetectionPage() {
                     dateRange={result.date_range}
                     mode={mode}
                     showTimeAxis={idx === result.models.length - 1}
+                    paddingLeft={chartMargins.left}
+                    paddingRight={chartMargins.right}
                   />
                 </div>
               ))}

@@ -5,7 +5,7 @@ export type TimeSeries = [string, number][]
 // ── Vol Eval ──────────────────────────────────────────────────────────────
 
 export interface VolEvalRequest {
-  asset: 'BTC' | 'ETH'
+  target_assets: string[]
   freq: string
   min_train_bars: number
   test_size: number
@@ -18,11 +18,22 @@ export interface VolModelMetrics {
   mae: number
 }
 
+export interface VolRollingMetrics {
+  qlike: TimeSeries
+  mse: TimeSeries
+}
+
 export interface VolEvalResult {
   comparison_table: Record<string, VolModelMetrics>
   forecasts: Record<string, TimeSeries>
   realised: TimeSeries
+  rolling_metrics?: Record<string, VolRollingMetrics>
   asset: string
+  freq: string
+}
+
+export interface VolEvalMultiResult {
+  per_asset: Record<string, VolEvalResult>
   freq: string
 }
 

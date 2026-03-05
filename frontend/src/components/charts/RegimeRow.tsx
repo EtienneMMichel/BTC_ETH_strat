@@ -28,18 +28,28 @@ interface RegimeRowProps {
   dateRange: [string, string]
   mode: 'max' | 'prob'
   showTimeAxis?: boolean
+  paddingLeft?: number
+  paddingRight?: number
 }
 
 function MaxStrip({
   labels,
   colorMap,
+  paddingLeft = 0,
+  paddingRight = 0,
 }: {
   labels: [string, string][]
   uniqueRegimes: string[]
   colorMap: Record<string, string>
+  paddingLeft?: number
+  paddingRight?: number
 }) {
   const total = labels.length
   if (total === 0) return null
+
+  const tsFirst = Date.parse(labels[0][0])
+  const tsLast = Date.parse(labels[total - 1][0])
+  const totalMs = tsLast - tsFirst || 1
 
   // Run-length encode
   const segments: { label: string; start: number; end: number }[] = []
@@ -53,23 +63,27 @@ function MaxStrip({
   }
 
   return (
-    <svg width="100%" height={28} className="rounded overflow-hidden">
-      {segments.map((seg, idx) => {
-        const x = (seg.start / total) * 100
-        const w = ((seg.end - seg.start + 1) / total) * 100
-        return (
-          <rect
-            key={idx}
-            x={`${x}%`}
-            y={0}
-            width={`${w}%`}
-            height={28}
-            fill={colorMap[seg.label] ?? '#64748b'}
-            opacity={0.75}
-          />
-        )
-      })}
-    </svg>
+    <div style={{ paddingLeft, paddingRight }}>
+      <svg width="100%" height={28} className="rounded overflow-hidden">
+        {segments.map((seg, idx) => {
+          const xFrac = (Date.parse(labels[seg.start][0]) - tsFirst) / totalMs
+          const wFrac =
+            (Date.parse(labels[seg.end][0]) - Date.parse(labels[seg.start][0])) / totalMs +
+            1 / total
+          return (
+            <rect
+              key={idx}
+              x={`${xFrac * 100}%`}
+              y={0}
+              width={`${Math.max(wFrac * 100, 0.1)}%`}
+              height={28}
+              fill={colorMap[seg.label] ?? '#64748b'}
+              opacity={0.75}
+            />
+          )
+        })}
+      </svg>
+    </div>
   )
 }
 
@@ -77,18 +91,27 @@ function ProbStrip({
   probabilities,
   uniqueRegimes,
   colorMap,
+  paddingLeft = 0,
+  paddingRight = 0,
 }: {
   probabilities: Record<string, [string, number][]>
   uniqueRegimes: string[]
   colorMap: Record<string, string>
+  paddingLeft?: number
+  paddingRight?: number
 }) {
   const height = 72
 
   // All regimes must have same length; use first available
   const firstKey = uniqueRegimes[0]
   if (!firstKey || !probabilities[firstKey]) return null
-  const n = probabilities[firstKey].length
+  const probs0 = probabilities[firstKey]
+  const n = probs0.length
   if (n === 0) return null
+
+  const tsFirst = Date.parse(probs0[0][0])
+  const tsLast = Date.parse(probs0[n - 1][0])
+  const totalMs = tsLast - tsFirst || 1
 
   // Build stacked polygon paths per regime
   const paths = useMemo(() => {
@@ -106,50 +129,54 @@ function ProbStrip({
       const getTop = (t: number): number => getBottom(t) + (probs[t]?.[1] ?? 0)
 
       const pts: string[] = []
-      // Left to right along top edge
+      // Left to right along top edge — use timestamp fractions for x
       for (let t = 0; t < n; t++) {
-        const x = (t / (n - 1)) * 100
+        const xFrac = (Date.parse(probs0[t][0]) - tsFirst) / totalMs
+        const x = xFrac * 100
         const y = (1 - getTop(t)) * height
         pts.push(`${x}%,${y}`)
       }
       // Right to left along bottom edge
       for (let t = n - 1; t >= 0; t--) {
-        const x = (t / (n - 1)) * 100
+        const xFrac = (Date.parse(probs0[t][0]) - tsFirst) / totalMs
+        const x = xFrac * 100
         const y = (1 - getBottom(t)) * height
         pts.push(`${x}%,${y}`)
       }
       return { regime, points: pts.join(' '), color: colorMap[regime] ?? '#64748b' }
     })
-  }, [probabilities, uniqueRegimes, colorMap, n, height])
+  }, [probabilities, uniqueRegimes, colorMap, n, height, tsFirst, totalMs, probs0])
 
   return (
-    <div className="relative">
-      {/* Y-axis labels */}
-      <div className="absolute left-0 top-0 h-full flex flex-col justify-between pointer-events-none text-[9px] text-slate-500 pr-1" style={{ width: 28 }}>
-        <span>100%</span>
-        <span>50%</span>
-        <span>0%</span>
-      </div>
-      <div style={{ marginLeft: 30 }}>
-        <svg width="100%" height={height} className="rounded overflow-hidden">
-          {paths.map(({ regime, points, color }) => (
-            <polygon
-              key={regime}
-              points={points}
-              fill={color}
-              opacity={0.75}
+    <div style={{ paddingLeft, paddingRight }}>
+      <div className="relative">
+        {/* Y-axis labels */}
+        <div className="absolute left-0 top-0 h-full flex flex-col justify-between pointer-events-none text-[9px] text-slate-500 pr-1" style={{ width: 28 }}>
+          <span>100%</span>
+          <span>50%</span>
+          <span>0%</span>
+        </div>
+        <div style={{ marginLeft: 30 }}>
+          <svg width="100%" height={height} className="rounded overflow-hidden">
+            {paths.map(({ regime, points, color }) => (
+              <polygon
+                key={regime}
+                points={points}
+                fill={color}
+                opacity={0.75}
+              />
+            ))}
+            {/* 50% guide line */}
+            <line
+              x1="0"
+              y1={height / 2}
+              x2="100%"
+              y2={height / 2}
+              stroke="rgba(255,255,255,0.1)"
+              strokeWidth={1}
             />
-          ))}
-          {/* 50% guide line */}
-          <line
-            x1="0"
-            y1={height / 2}
-            x2="100%"
-            y2={height / 2}
-            stroke="rgba(255,255,255,0.1)"
-            strokeWidth={1}
-          />
-        </svg>
+          </svg>
+        </div>
       </div>
     </div>
   )
@@ -164,6 +191,8 @@ export function RegimeRow({
   dateRange,
   mode,
   showTimeAxis = false,
+  paddingLeft = 0,
+  paddingRight = 0,
 }: RegimeRowProps) {
   const colorMap = useMemo(() => buildColorMap(uniqueRegimes), [uniqueRegimes])
 
@@ -191,12 +220,20 @@ export function RegimeRow({
 
       {/* Chart strip */}
       {mode === 'max' ? (
-        <MaxStrip labels={labels} uniqueRegimes={uniqueRegimes} colorMap={colorMap} />
+        <MaxStrip
+          labels={labels}
+          uniqueRegimes={uniqueRegimes}
+          colorMap={colorMap}
+          paddingLeft={paddingLeft}
+          paddingRight={paddingRight}
+        />
       ) : (
         <ProbStrip
           probabilities={probabilities}
           uniqueRegimes={uniqueRegimes}
           colorMap={colorMap}
+          paddingLeft={paddingLeft}
+          paddingRight={paddingRight}
         />
       )}
 

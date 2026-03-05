@@ -93,6 +93,37 @@ def _run_backtest_sync(req: BacktestRequest) -> BacktestResultSchema:
     elif req.strategy == "mean_reversion":
         from core.strats.mean_reversion.strategy import MeanReversionStrategy
         strategy = MeanReversionStrategy()
+    elif req.strategy == "markowitz":
+        from core.strats.markowitz.strategy import MarkowitzStrategy
+        from core.models.covariance.rolling import RollingCovModel
+        from core.models.covariance.diagonal import DiagonalCovModel
+        from core.models.covariance.bekk_cov import BEKKCovModel
+        from core.models.expected_returns.rolling_mean import RollingMeanReturns
+        from core.models.expected_returns.signal import SignalExpectedReturns
+        from core.models.forecast.price.momentum import TSMOMModel
+
+        p = req.markowitz
+        cov_map = {
+            "rolling": RollingCovModel(),
+            "diagonal": DiagonalCovModel(),
+            "bekk": BEKKCovModel(),
+        }
+        er_map = {
+            "rolling_mean": RollingMeanReturns(),
+            "signal_tsmom": SignalExpectedReturns(model_cls=TSMOMModel),
+        }
+        strategy = MarkowitzStrategy(
+            cov_model=cov_map[p.cov_model],
+            expected_returns=er_map[p.er_model],
+            objective=p.objective,
+            gamma=p.gamma,
+            long_only=p.long_only,
+            max_weight=p.max_weight,
+            min_weight=p.min_weight,
+            risk_free_rate=p.risk_free_rate,
+            target_vol=p.target_vol,
+            min_history=p.min_history,
+        )
     else:
         from core.strats.orchestrator.regime import OrchestratorStrategy
         strategy = OrchestratorStrategy()
@@ -111,6 +142,17 @@ def _run_backtest_sync(req: BacktestRequest) -> BacktestResultSchema:
         (ts.isoformat(), float(val))
         for ts, val in result.equity_curve.items()
     ]
+
+    # Compute buy-and-hold benchmarks (normalized to 1.0 at start)
+    eq_idx = result.equity_curve.index
+    benchmarks: dict[str, list[tuple[str, float]]] = {}
+    for asset in req.assets:
+        asset_prices = prices[asset].reindex(eq_idx).ffill()
+        cumulative = asset_prices / asset_prices.iloc[0]
+        benchmarks[asset] = [
+            (ts.isoformat(), float(val))
+            for ts, val in cumulative.items()
+        ]
 
     # Serialize signals
     if result.signals.empty:
@@ -131,6 +173,7 @@ def _run_backtest_sync(req: BacktestRequest) -> BacktestResultSchema:
 
     schema = BacktestResultSchema(
         equity_curve=equity_curve,
+        benchmarks=benchmarks,
         metrics={k: float(v) for k, v in result.metrics.items()},
         trade_count=trade_count,
         signals=signals,

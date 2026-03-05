@@ -14,6 +14,8 @@ from back_api.schemas.vol_eval import VolEvalRequest
 
 router = APIRouter()
 
+_ROLLING_WINDOW = 63
+
 
 def _get_store(request: Request) -> JobStore:
     return request.app.state.job_store
@@ -27,27 +29,18 @@ def _series_to_timeseries(s: pd.Series) -> list[list]:
     ]
 
 
-def _run_vol_eval_sync(req: VolEvalRequest) -> dict[str, Any]:
-    from core.backtest.data.loader import load_assets
+def _run_single_asset_eval(
+    ohlcv: pd.DataFrame,
+    requested: list[str],
+) -> dict[str, Any]:
+    """Run vol forecast comparison for one asset."""
     from core.evaluation.reports.compare import comparison_table
     from core.models.forecast.volatility.realized import rogers_satchell, yang_zhang
-
-    settings = get_settings()
-    data_dir = req.data_dir if req.data_dir else str(settings.data_dir)
-
-    ohlcv_multi = load_assets(data_dir, req.assets, req.freq)
-    asset = req.asset
-    ohlcv = pd.DataFrame({
-        col: ohlcv_multi[asset][col]
-        for col in ["open", "high", "low", "close", "volume"]
-        if col in ohlcv_multi[asset].columns
-    })
 
     close = ohlcv["close"]
     returns = np.log(close).diff().dropna()
 
     forecasts: dict[str, pd.Series] = {}
-    requested = req.models
 
     # ── Parametric models ──────────────────────────────────────────────────
     if "garch" in requested:
@@ -93,19 +86,58 @@ def _run_vol_eval_sync(req: VolEvalRequest) -> dict[str, Any]:
     forecasts_aligned = {k: v.loc[common_idx] for k, v in forecasts.items()}
     realised_aligned = realised.loc[common_idx]
 
-    # Comparison table (exclude realized vol models from QLIKE scoring since
-    # they are not forecasts in the parametric sense — include anyway for ref)
+    # Comparison table
     table_df = comparison_table(forecasts_aligned, realised_aligned)
     comparison = {
         model: {metric: float(val) for metric, val in row.items()}
         for model, row in table_df.to_dict(orient="index").items()
     }
 
+    # ── Rolling metrics ────────────────────────────────────────────────────
+    rolling_metrics: dict[str, dict[str, list[list]]] = {}
+    for model_name, f in forecasts_aligned.items():
+        r = realised_aligned
+        f_safe = f.clip(lower=1e-10)
+        qlike_ts = (np.log(f_safe**2) + r**2 / f_safe**2).rolling(_ROLLING_WINDOW).mean()
+        mse_ts = ((f - r) ** 2).rolling(_ROLLING_WINDOW).mean()
+        rolling_metrics[model_name] = {
+            "qlike": _series_to_timeseries(qlike_ts.dropna()),
+            "mse": _series_to_timeseries(mse_ts.dropna()),
+        }
+
     return {
         "comparison_table": comparison,
         "forecasts": {k: _series_to_timeseries(v) for k, v in forecasts_aligned.items()},
         "realised": _series_to_timeseries(realised_aligned),
-        "asset": req.asset,
+        "rolling_metrics": rolling_metrics,
+    }
+
+
+def _run_vol_eval_sync(req: VolEvalRequest) -> dict[str, Any]:
+    from core.backtest.data.loader import load_assets
+
+    settings = get_settings()
+    data_dir = req.data_dir if req.data_dir else str(settings.data_dir)
+
+    ohlcv_multi = load_assets(data_dir, req.assets, req.freq)
+
+    target_assets = req.effective_assets
+
+    per_asset: dict[str, Any] = {}
+    for asset in target_assets:
+        if asset not in ohlcv_multi:
+            continue
+        ohlcv = pd.DataFrame({
+            col: ohlcv_multi[asset][col]
+            for col in ["open", "high", "low", "close", "volume"]
+            if col in ohlcv_multi[asset].columns
+        })
+        per_asset[asset] = _run_single_asset_eval(ohlcv, req.models)
+        per_asset[asset]["asset"] = asset
+        per_asset[asset]["freq"] = req.freq
+
+    return {
+        "per_asset": per_asset,
         "freq": req.freq,
     }
 

@@ -17,6 +17,8 @@ export default defineConfig({
       '/price-forecast': 'http://localhost:8000',
       '/co-mov': 'http://localhost:8000',
       '/regime-detection': 'http://localhost:8000',
+      '/markowitz': 'http://localhost:8000',
+      '/compare': 'http://localhost:8000',
     },
   },
 })

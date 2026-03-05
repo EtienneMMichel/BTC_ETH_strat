@@ -71,7 +71,7 @@ export function BacktestPage() {
           <>
             <div>
               <h2 className="text-sm font-medium text-slate-400 mb-2">Equity Curve</h2>
-              <EquityChart equityCurve={result.equity_curve} />
+              <EquityChart equityCurve={result.equity_curve} label="Strategy" benchmarks={result.benchmarks} />
             </div>
             <div>
               <h2 className="text-sm font-medium text-slate-400 mb-2">Portfolio Weights</h2>
